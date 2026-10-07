@@ -4,97 +4,83 @@
 
 English · [Русский](README.ru.md)
 
-`git-lineage` is a cross-platform Rust CLI that renders a compact semantic tree of Git branches. It focuses on relationships instead of printing every commit: logical parents, ahead/behind counts, upstream divergence, sibling comparisons, and synced upstream branches.
+`git-lineage` renders the factual history-inclusion graph of every local and remote branch ref. It uses only Git history—there is no project configuration and no concept of an assigned or logical parent.
 
-With explanatory insights disabled, `git lineage --summary none` produces output like this:
+The graph is built as follows:
+
+1. Read every ref under `refs/heads` and `refs/remotes`.
+2. Group names that point to the same commit.
+3. Compute the left-only and right-only commit counts for every pair, equivalent to `git rev-list --left-right --count A...B`.
+4. Order histories by strict inclusion and remove transitive edges.
+5. Report diverged pairs separately. A merge ref can therefore have multiple immediate history parents.
 
 ```text
-Fetched origin; branch graph:
+Factual ref graph from local data:
 
-main
-├─ dev (current)                 +8 from main
-│  └─ origin/dev                 +1 from dev
-│     └─ commands-fun            +12 from origin/dev
-└─ web-ui                        +13 from main
+main (= origin/main)
+└─ dev (= origin/dev, origin/player-fix)  +8 from main
+   └─ commands-fun (current)              +12 from dev
+
+Refs: 6, nodes: 3 (coincident refs merged: 3), edges after transitive reduction: 2.
 ```
 
 ## Installation
 
-Recommended installation from crates.io; `--locked` uses the dependency versions tested for the release:
+Install the latest release from crates.io:
 
 ```console
 cargo install git-lineage --locked
 ```
 
-Cargo installs `git-lineage` into the configured installation root's `bin` directory. With the default settings, this is `$CARGO_HOME/bin`—normally `~/.cargo/bin`, or `%USERPROFILE%\.cargo\bin` on Windows. That directory must be present in `PATH`; Git only discovers external `git-*` commands that it can find in `PATH`.
-
-Verify both executable forms after installation:
+Cargo normally installs the executable into `~/.cargo/bin`, or `%USERPROFILE%\.cargo\bin` on Windows. That directory must be in `PATH` for Git to discover the external `git-lineage` command.
 
 ```console
 git-lineage --version
 git lineage --version
 ```
 
-If `git-lineage` works but `git lineage` does not, check that the directory containing `git-lineage` is in `PATH` and restart the terminal.
-
-To install the current development version from `main` instead of the latest crates.io release:
+Install the current 0.2 development branch with:
 
 ```console
-cargo install --git https://github.com/bronekot/git-lineage --locked
+cargo install --git https://github.com/bronekot/git-lineage --branch dev --locked
 ```
 
-[GitHub Releases](https://github.com/bronekot/git-lineage/releases) provide prebuilt archives for these targets:
-
-- Windows x86_64: `x86_64-pc-windows-msvc`
-- Linux x86_64: `x86_64-unknown-linux-musl`
-- macOS Apple Silicon: `aarch64-apple-darwin`
-
-After extracting an archive, move the `git-lineage` executable—or its containing directory—to a location in `PATH`.
+[GitHub Releases](https://github.com/bronekot/git-lineage/releases) provide archives for Windows x86_64, Linux x86_64, and macOS Apple Silicon.
 
 ## Usage
 
-With the default settings, `git lineage` runs `git fetch --prune --quiet -- origin` before building the report. To use the refs already stored in the local repository:
+By default, `git lineage` fetches and prunes `origin` before reading all locally stored branch refs. Select another remote to fetch with `--remote`; refs from every remote are always included in the graph.
 
 ```console
+git lineage
 git lineage --no-fetch
 git lineage --offline
+git lineage --remote upstream
 ```
-
-The report header indicates whether the remote was fetched, fetching was skipped, or cached data was used after a failed fetch.
-
-Common commands:
 
 | Command | Purpose |
 | --- | --- |
-| `git lineage` | Build the default report |
-| `git lineage init` | Create `.git-lineage.toml` |
-| `git lineage discover` | Print a complete proposed TOML configuration |
-| `git lineage discover --write` | Rewrite `.git-lineage.toml` with discovered relationships |
-| `git lineage parent <CHILD> <PARENT>` | Set a logical parent |
-| `git lineage parent <CHILD> --unset` | Remove a logical parent |
-| `git lineage check` | Validate refs, configured ancestry, the selected remote, and cycles |
-| `git lineage language [LANGUAGE]` | Show or save the interface language; supported values are `en` and `ru` |
-
-`discover --write` and `parent` serialize the entire TOML file. Even when only relationships change, comments and hand formatting are lost. Back up or commit `.git-lineage.toml` before using them on a file whose formatting matters. `init --force` overwrites an existing configuration file.
-
-Report options:
+| `git lineage` | Build the factual graph |
+| `git lineage report` | Build the factual graph explicitly |
+| `git lineage language [LANGUAGE]` | Show or save the interface language (`en` or `ru`) |
 
 | Option | Effect |
 | --- | --- |
-| `--summary none` | Omit explanatory insights; warnings are still shown |
-| `--summary brief` | Show the default concise insights |
-| `--summary full` | Show all insights, inferred parents, remote-only refs, and unplaced branches |
-| `--format json` | Emit machine-readable JSON instead of text |
-| `--color always` | Force color; `auto` and `never` are also supported |
+| `--summary none` | Omit explanatory insights; warnings remain visible |
+| `--summary brief` | Explain tracking relations, deleted upstreams, and how the current branch diverged from its siblings (default) |
+| `--summary full` | Explain every divergent ref pair |
+| `--format json` | Include nodes, all pair relations, reduced edges, insights, and counters as JSON |
+| `--color always` | Force color; `auto` (honors `NO_COLOR`) and `never` are also supported |
 | `--ascii` | Use ASCII tree characters |
-| `--all-remotes` | Allow refs from every remote into the report's scope |
-| `--show-synced-remotes` | Show synced upstream refs instead of collapsing them |
+| `--remote NAME` | Fetch `NAME` instead of `origin`; this does not filter displayed refs |
 
-`--all-remotes` does not by itself display every remote-only ref. Combine it with `--summary full`, or set `show_remote_only = true`, when those refs should appear.
+In brief mode the number of other diverged pairs is shown as a hint and as `hidden_diverged_pairs` in JSON.
+
+Each JSON pair relation contains `left_only` and `right_only` counts plus one of `left_ancestor`, `right_ancestor`, or `diverged`. Equal commit pointers are represented as aliases in one node.
 
 ## Language
 
-English is the default interface language. Show the current language or save a different one with:
+English is the default. The selection is stored globally as `git-lineage.language` and survives terminal restarts:
 
 ```console
 git lineage language
@@ -102,56 +88,27 @@ git lineage language ru
 git lineage language en
 ```
 
-The selection is stored in the global Git configuration as `git-lineage.language`, so it applies to every repository and survives terminal restarts. The `lang` alias is also accepted. JSON field names and insight `kind` values remain stable across languages. Interface text produced directly by `git-lineage` follows the selected language; diagnostics from Git, the operating system, or parsing libraries may retain their own language.
+JSON field names and insight `kind` values do not depend on the selected language.
 
 ## Configuration
 
-`.git-lineage.toml` is optional. Explicit parent relationships take priority over automatic discovery.
+There is no `.git-lineage.toml`. Files with that name are ignored. The report is derived entirely from refs and commit history; `init`, `discover`, `parent`, and `check` are not 0.2 commands.
 
-```toml
-version = 1
-root = "main"
-remote = "origin"
-fetch = true
+## Safety
 
-[parents]
-dev = "main"
-feature = "origin/dev"
+`git-lineage` invokes system Git with separate process arguments and sets `GIT_TERMINAL_PROMPT=0`. It never asks Git to perform `merge`, `rebase`, `reset`, `cherry-pick`, or `push`.
 
-[display]
-collapse_synced_upstreams = true
-show_remote_only = false
-summary = "brief"
-```
-
-- `collapse_synced_upstreams` hides an upstream ref when it points to the same commit as its local branch.
-- `show_remote_only` includes remote refs that are not an upstream or an explicitly configured branch.
-- `summary` accepts `none`, `brief`, or `full`.
-
-Use full ref names such as `refs/heads/dev` when a short name is ambiguous.
-
-## Safety and repository changes
-
-`git-lineage` invokes the system Git with separate process arguments instead of constructing a shell command, and sets `GIT_TERMINAL_PROMPT=0`. It never asks Git to perform `merge`, `rebase`, `reset`, `cherry-pick`, or `push`. The system Git may still invoke credential, transport, or SSH helpers from the user's Git configuration.
-
-The default report runs `git fetch --prune`. Its exact effects are governed by Git configuration and the selected remote's refspecs: Git writes `FETCH_HEAD`, updates or prunes configured refs, may auto-follow tags, may fetch populated submodules, and may run automatic maintenance. Use `--no-fetch` to prevent this network operation and its ref updates.
-
-The report command does not write `.git-lineage.toml`. The `init`, `discover --write`, and `parent` commands do write it, while `language` writes `git-lineage.language` to the global Git configuration.
-
-If fetch fails and the refs already stored locally are sufficient, the report continues and identifies that it used cached data. In JSON mode, `stdout` remains machine-readable and diagnostics are sent to `stderr`.
+The default report does run `git fetch --prune`. Git may update or remove remote-tracking refs, write `FETCH_HEAD`, follow tags, fetch configured submodules, and run maintenance. Use `--no-fetch` to avoid network access and ref changes. If the remote is not configured, the report uses local data without an error. If fetching fails, the report continues with cached refs when possible. JSON diagnostics are written to `stderr` so `stdout` remains valid JSON.
 
 ## Platform and toolchain support
 
-- Windows, Linux, and macOS when built with Cargo
+- Windows, Linux, and macOS
 - Rust 1.85 or newer
 - System Git available in `PATH`
-- `git-lineage` available in `PATH` for the `git lineage` form
-
-See the exact prebuilt targets in the [Installation](#installation) section.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). Release maintainers should also read [RELEASING.md](RELEASING.md). Security issues must follow [SECURITY.md](SECURITY.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md), [RELEASING.md](RELEASING.md), and [SECURITY.md](SECURITY.md).
 
 ## License
 

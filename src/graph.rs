@@ -1,348 +1,447 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
 use crate::{
-    config::LineageConfig,
-    error::{ConfigIssue, Result},
+    error::{LineageError, Result},
     git::GitRepo,
     refs::{GitRef, RefKind, RefSet},
     relation::Relation,
 };
 
 #[derive(Debug, Clone, Serialize)]
+pub struct GraphParent {
+    #[serde(skip)]
+    pub id: String,
+    pub ahead: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct GraphNode {
     #[serde(skip)]
     pub id: String,
-    pub name: String,
-    pub kind: RefKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ahead: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub behind: Option<u64>,
-    pub current: bool,
     #[serde(skip)]
-    pub tracking_remote: bool,
+    pub oid: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub kind: RefKind,
+    pub parents: Vec<GraphParent>,
+    pub current: bool,
 }
 
 impl GraphNode {
-    pub fn relation(&self) -> Option<Relation> {
-        Some(Relation {
-            ahead: self.ahead?,
-            behind: self.behind?,
-        })
+    pub fn display_name(&self) -> String {
+        if self.aliases.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{} (= {})", self.name, self.aliases.join(", "))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairRelation {
+    #[serde(skip)]
+    pub left: String,
+    #[serde(skip)]
+    pub right: String,
+    pub left_only: u64,
+    pub right_only: u64,
+}
+
+/// Commit counts for every node history and for every pairwise intersection.
+#[derive(Debug, Clone)]
+struct HistoryMatrix {
+    len: usize,
+    sizes: Vec<u64>,
+    shared: Vec<u64>,
+}
+
+impl HistoryMatrix {
+    fn relation(&self, left: usize, right: usize) -> Relation {
+        let both = self.shared[left * self.len + right];
+        Relation {
+            behind: self.sizes[left] - both,
+            ahead: self.sizes[right] - both,
+        }
+    }
+
+    fn is_strict_ancestor(&self, ancestor: usize, descendant: usize) -> bool {
+        let relation = self.relation(ancestor, descendant);
+        relation.behind == 0 && relation.ahead > 0
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct BranchGraph {
-    pub root: String,
+    pub roots: Vec<String>,
     pub nodes: BTreeMap<String, GraphNode>,
-    pub unplaced: Vec<String>,
+    pub pair_relations: Vec<PairRelation>,
+    ids: Vec<String>,
+    index: HashMap<String, usize>,
+    history: HistoryMatrix,
+    pub total_refs: usize,
+    pub merged_aliases: usize,
+    pub edge_count: usize,
 }
 
 impl BranchGraph {
-    #[allow(clippy::too_many_arguments)]
-    pub fn build(
-        repo: &GitRepo,
-        refs: &RefSet,
-        config: &LineageConfig,
-        root_name: &str,
-        remote: &str,
-        all_remotes: bool,
-        show_synced_remotes: bool,
-        current_branch: Option<&str>,
-    ) -> Result<Self> {
-        let allowed = refs.filtered_ids(remote, all_remotes);
-        let root_raw = refs.resolve(root_name)?;
-        if !allowed.contains(&root_raw) {
-            return Err(ConfigIssue::RootExcluded(root_name.into()).into());
+    /// Builds the graph; `current_branch` is a full ref name such as `refs/heads/main`.
+    pub fn build(repo: &GitRepo, refs: &RefSet, current_branch: Option<&str>) -> Result<Self> {
+        if refs.refs.is_empty() {
+            return Err(LineageError::NoRefs);
         }
 
-        let collapse = config.display.collapse_synced_upstreams && !show_synced_remotes;
-        let mut aliases = HashMap::<String, String>::new();
-        let mut upstream_pairs = Vec::<(String, String)>::new();
-
-        for local in refs.refs.values().filter(|r| r.kind == RefKind::Local) {
-            let Some(upstream_name) = local.upstream.as_deref() else {
-                continue;
-            };
-            let Some(upstream_id) = refs.resolve_upstream(upstream_name) else {
-                continue;
-            };
-            if !allowed.contains(&upstream_id) {
-                continue;
-            }
-            upstream_pairs.push((local.full_name.clone(), upstream_id.clone()));
-            let upstream = &refs.refs[&upstream_id];
-            if collapse && local.oid == upstream.oid {
-                aliases.insert(upstream_id.clone(), local.full_name.clone());
-            }
+        let current_id = current_branch.filter(|name| refs.refs.contains_key(*name));
+        let mut by_oid = BTreeMap::<String, Vec<&GitRef>>::new();
+        for item in refs.refs.values() {
+            by_oid.entry(item.oid.clone()).or_default().push(item);
         }
 
-        let canonical = |id: String| aliases.get(&id).cloned().unwrap_or(id);
-        let root = canonical(root_raw);
+        let total_refs = refs.refs.len();
+        let merged_aliases = total_refs.saturating_sub(by_oid.len());
 
-        let mut required = BTreeSet::new();
-        for item in refs.refs.values().filter(|r| r.kind == RefKind::Local) {
-            if allowed.contains(&item.full_name) {
-                required.insert(item.full_name.clone());
-            }
-        }
-        for (local, upstream) in &upstream_pairs {
-            required.insert(local.clone());
-            required.insert(upstream.clone());
-        }
-        required.insert(root.clone());
-
-        // Explicit config references are always relevant, including remote-only refs.
-        let mut configured_edges = Vec::new();
-        for (child_name, parent_name) in &config.parents {
-            let child = refs.resolve(child_name)?;
-            let parent = refs.resolve(parent_name)?;
-            if !allowed.contains(&child) || !allowed.contains(&parent) {
-                return Err(ConfigIssue::EdgeOutOfScope {
-                    child: child_name.clone(),
-                    parent: parent_name.clone(),
-                }
-                .into());
-            }
-            required.insert(child.clone());
-            required.insert(parent.clone());
-            configured_edges.push((canonical(child), canonical(parent)));
-        }
-        if config.display.show_remote_only {
-            required.extend(allowed.iter().cloned());
-        }
-
-        let current_id = current_branch.and_then(|name| refs.resolve(name).ok());
         let mut nodes = BTreeMap::new();
-        for id in required {
-            if aliases.contains_key(&id) {
-                continue;
-            }
-            let item = refs
-                .refs
-                .get(&id)
-                .ok_or_else(|| ConfigIssue::MissingRef(id.clone()))?;
+        for (oid, mut group) in by_oid {
+            group.sort_by_key(|item| (primary_rank(item, current_id), item.name.as_str()));
+            let primary = group[0];
+            let id = primary.full_name.clone();
+            let mut aliases: Vec<_> = group[1..].iter().map(|item| item.name.clone()).collect();
+            aliases.sort();
+            let current = group
+                .iter()
+                .any(|item| current_id == Some(item.full_name.as_str()));
             nodes.insert(
                 id.clone(),
-                node_from_ref(item, current_id.as_deref() == Some(&id)),
+                GraphNode {
+                    id,
+                    oid,
+                    name: primary.name.clone(),
+                    aliases,
+                    kind: primary.kind,
+                    parents: Vec::new(),
+                    current,
+                },
             );
         }
 
-        // Configuration wins over inferred tracking relationships.
-        for (child, parent) in configured_edges {
-            if child == root {
-                return Err(ConfigIssue::RootHasParent.into());
+        let ids: Vec<_> = nodes.keys().cloned().collect();
+        let index: HashMap<_, _> = ids
+            .iter()
+            .enumerate()
+            .map(|(position, id)| (id.clone(), position))
+            .collect();
+        let tips: Vec<_> = ids.iter().map(|id| nodes[id].oid.as_str()).collect();
+        let history = read_history_matrix(repo, &tips)?;
+
+        let mut pair_relations = Vec::new();
+        for left in 0..ids.len() {
+            for right in (left + 1)..ids.len() {
+                let relation = history.relation(left, right);
+                pair_relations.push(PairRelation {
+                    left: ids[left].clone(),
+                    right: ids[right].clone(),
+                    left_only: relation.behind,
+                    right_only: relation.ahead,
+                });
             }
-            if child == parent {
-                continue;
-            }
+        }
+
+        let edges = transitive_reduction(ids.len(), |ancestor, descendant| {
+            history.is_strict_ancestor(ancestor, descendant)
+        });
+        for &(parent, child) in &edges {
+            let ahead = history.relation(parent, child).ahead;
             nodes
-                .get_mut(&child)
-                .ok_or_else(|| ConfigIssue::HiddenBranch(child.clone()))?
-                .parent = Some(parent);
+                .get_mut(&ids[child])
+                .expect("reduction used an indexed node")
+                .parents
+                .push(GraphParent {
+                    id: ids[parent].clone(),
+                    ahead,
+                });
         }
-
-        for (local_raw, upstream_raw) in upstream_pairs {
-            let local = canonical(local_raw);
-            let upstream = canonical(upstream_raw);
-            if local == upstream || !nodes.contains_key(&upstream) {
-                continue;
-            }
-            let upstream_node = nodes.get_mut(&upstream).expect("checked above");
-            if upstream_node.parent.is_none() && upstream != root {
-                upstream_node.parent = Some(local.clone());
-            }
-            if upstream_node.parent.as_deref() == Some(&local) {
-                upstream_node.tracking_remote = true;
-            }
-        }
-
-        if let Some(root_node) = nodes.get_mut(&root) {
-            root_node.parent = None;
-        }
-        validate_parents(&nodes)?;
-
-        let edges: Vec<_> = nodes
+        let names: HashMap<_, _> = nodes
             .iter()
-            .filter_map(|(id, node)| node.parent.as_ref().map(|p| (id.clone(), p.clone())))
+            .map(|(id, node)| (id.clone(), node.name.clone()))
             .collect();
-        let pairs: Vec<_> = edges
-            .iter()
-            .map(|(child, parent)| (parent.clone(), child.clone()))
-            .collect();
-        let relations = Relation::between_many(repo, &pairs)?;
-        for ((child, _parent), relation) in edges.into_iter().zip(relations) {
-            let node = nodes.get_mut(&child).expect("edge came from nodes");
-            node.ahead = Some(relation.ahead);
-            node.behind = Some(relation.behind);
+        for node in nodes.values_mut() {
+            node.parents.sort_by(|a, b| names[&a.id].cmp(&names[&b.id]));
         }
 
-        let mut unplaced: Vec<_> = nodes
+        let mut roots: Vec<_> = nodes
             .values()
-            .filter(|node| node.id != root && node.parent.is_none())
-            .map(|node| node.name.clone())
+            .filter(|node| node.parents.is_empty())
+            .map(|node| node.id.clone())
             .collect();
-        unplaced.sort();
+        roots.sort_by(|a, b| root_sort_key(&nodes[a]).cmp(&root_sort_key(&nodes[b])));
 
         Ok(Self {
-            root,
+            roots,
             nodes,
-            unplaced,
+            pair_relations,
+            ids,
+            index,
+            history,
+            total_refs,
+            merged_aliases,
+            edge_count: edges.len(),
         })
     }
 
-    pub fn children(&self, parent: &str) -> Vec<&GraphNode> {
+    pub fn children(&self, parent: &str) -> Vec<(&GraphNode, &GraphParent)> {
         let mut children: Vec<_> = self
             .nodes
             .values()
-            .filter(|n| n.parent.as_deref() == Some(parent))
+            .filter_map(|node| {
+                node.parents
+                    .iter()
+                    .find(|edge| edge.id == parent)
+                    .map(|edge| (node, edge))
+            })
             .collect();
-        children.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+        children.sort_by_key(|(node, _)| node_sort_key(node));
         children
     }
 
-    pub fn reachable_ids(&self) -> BTreeSet<String> {
-        let mut result = BTreeSet::new();
-        let mut stack = vec![self.root.clone()];
-        while let Some(id) = stack.pop() {
-            if !result.insert(id.clone()) {
-                continue;
-            }
-            stack.extend(self.children(&id).into_iter().map(|n| n.id.clone()));
-        }
-        result
+    pub fn relation(&self, left: &str, right: &str) -> Option<Relation> {
+        let left = *self.index.get(left)?;
+        let right = *self.index.get(right)?;
+        Some(self.history.relation(left, right))
     }
 
-    pub fn leaf_ids(&self) -> Vec<String> {
-        let reachable = self.reachable_ids();
-        reachable
-            .into_iter()
-            .filter(|id| self.children(id).is_empty())
-            .collect()
+    pub fn node_id_for_oid(&self, oid: &str) -> Option<&str> {
+        self.nodes
+            .values()
+            .find(|node| node.oid == oid)
+            .map(|node| node.id.as_str())
+    }
+
+    pub fn share_immediate_parent(&self, left: &str, right: &str) -> bool {
+        self.nodes[left].parents.iter().any(|left_parent| {
+            self.nodes[right]
+                .parents
+                .iter()
+                .any(|right_parent| right_parent.id == left_parent.id)
+        })
+    }
+
+    pub fn nearest_common_ancestors(&self, left: &str, right: &str) -> Vec<String> {
+        let (Some(&left), Some(&right)) = (self.index.get(left), self.index.get(right)) else {
+            return Vec::new();
+        };
+        let common: Vec<_> = (0..self.ids.len())
+            .filter(|&candidate| {
+                self.history.is_strict_ancestor(candidate, left)
+                    && self.history.is_strict_ancestor(candidate, right)
+            })
+            .collect();
+        let mut nearest: Vec<_> = common
+            .iter()
+            .filter(|&&candidate| {
+                !common
+                    .iter()
+                    .any(|&other| self.history.is_strict_ancestor(candidate, other))
+            })
+            .map(|&candidate| self.ids[candidate].clone())
+            .collect();
+        nearest.sort_by(|a, b| self.nodes[a].name.cmp(&self.nodes[b].name));
+        nearest
     }
 }
 
-fn node_from_ref(item: &GitRef, current: bool) -> GraphNode {
-    GraphNode {
-        id: item.full_name.clone(),
-        name: item.name.clone(),
-        kind: item.kind,
-        parent: None,
-        ahead: None,
-        behind: None,
-        current,
-        tracking_remote: false,
-    }
-}
-
-fn sort_key(node: &GraphNode) -> (u8, &str) {
-    let group = if node.tracking_remote {
+fn primary_rank(item: &GitRef, current: Option<&str>) -> u8 {
+    if current == Some(item.full_name.as_str()) {
         0
-    } else if node.kind == RefKind::Local {
+    } else if item.kind == RefKind::Local {
         1
     } else {
         2
+    }
+}
+
+/// Counts the commits reachable from each tip and from each pair of tips.
+///
+/// Every commit receives a bitset of the tips that reach it, propagated from
+/// children to parents in a single topological pass. Commits with the same
+/// bitset are counted together, so the pair counts cost one pass over the
+/// distinct bitsets instead of one set difference per pair.
+fn read_history_matrix(repo: &GitRepo, tips: &[&str]) -> Result<HistoryMatrix> {
+    let len = tips.len();
+    let mut input = tips.join("\n");
+    input.push('\n');
+    let bytes = repo.checked_with_input(
+        ["rev-list", "--topo-order", "--parents", "--stdin"],
+        input.into_bytes(),
+    )?;
+    let text = String::from_utf8_lossy(&bytes);
+
+    let mut commit_index = HashMap::<&str, usize>::new();
+    let mut parents = Vec::<Vec<usize>>::new();
+    let mut order = Vec::new();
+    let mut intern = |oid, parents: &mut Vec<Vec<usize>>| {
+        *commit_index.entry(oid).or_insert_with(|| {
+            parents.push(Vec::new());
+            parents.len() - 1
+        })
     };
-    (group, node.name.as_str())
-}
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(oid) = fields.next() else { continue };
+        let commit = intern(oid, &mut parents);
+        let commit_parents: Vec<_> = fields.map(|oid| intern(oid, &mut parents)).collect();
+        parents[commit] = commit_parents;
+        order.push(commit);
+    }
 
-fn validate_parents(nodes: &BTreeMap<String, GraphNode>) -> Result<()> {
-    for node in nodes.values() {
-        if let Some(parent) = &node.parent {
-            if !nodes.contains_key(parent) {
-                return Err(ConfigIssue::MissingParent {
-                    parent: parent.clone(),
-                    child: node.name.clone(),
-                }
-                .into());
+    let words = len.div_ceil(64).max(1);
+    let mut reach = vec![0u64; parents.len() * words];
+    for (tip_index, tip) in tips.iter().enumerate() {
+        if let Some(&commit) = commit_index.get(tip) {
+            reach[commit * words + tip_index / 64] |= 1 << (tip_index % 64);
+        }
+    }
+    // `--topo-order` lists every child before its parents.
+    let mut row = vec![0u64; words];
+    for &commit in &order {
+        row.copy_from_slice(&reach[commit * words..(commit + 1) * words]);
+        for &parent in &parents[commit] {
+            for (target, bits) in reach[parent * words..(parent + 1) * words]
+                .iter_mut()
+                .zip(&row)
+            {
+                *target |= bits;
             }
         }
     }
-    let parents: BTreeMap<_, _> = nodes
-        .iter()
-        .filter_map(|(id, n)| n.parent.as_ref().map(|p| (id.clone(), p.clone())))
-        .collect();
-    detect_cycles(&parents)
-}
 
-fn detect_cycles(parents: &BTreeMap<String, String>) -> Result<()> {
-    for start in parents.keys() {
-        let mut seen = HashSet::new();
-        let mut cursor = start.as_str();
-        while let Some(parent) = parents.get(cursor) {
-            if !seen.insert(cursor.to_owned()) {
-                return Err(ConfigIssue::Cycle(cursor.into()).into());
+    let mut groups = HashMap::<&[u64], u64>::new();
+    for &commit in &order {
+        *groups
+            .entry(&reach[commit * words..(commit + 1) * words])
+            .or_default() += 1;
+    }
+    let mut sizes = vec![0u64; len];
+    let mut shared = vec![0u64; len * len];
+    for (bits, count) in groups {
+        let members: Vec<_> = (0..len)
+            .filter(|&tip| bits[tip / 64] & (1 << (tip % 64)) != 0)
+            .collect();
+        for &left in &members {
+            sizes[left] += count;
+            for &right in &members {
+                shared[left * len + right] += count;
             }
-            cursor = parent;
         }
     }
-    Ok(())
+    Ok(HistoryMatrix { len, sizes, shared })
+}
+
+/// Returns `(parent, child)` edges of the strict-inclusion order with every
+/// edge implied by a longer path removed.
+fn transitive_reduction(
+    len: usize,
+    is_strict_ancestor: impl Fn(usize, usize) -> bool,
+) -> Vec<(usize, usize)> {
+    let mut edges = Vec::new();
+    for child in 0..len {
+        let ancestors: Vec<_> = (0..len)
+            .filter(|&candidate| is_strict_ancestor(candidate, child))
+            .collect();
+        for &parent in &ancestors {
+            let transitive = ancestors
+                .iter()
+                .any(|&middle| middle != parent && is_strict_ancestor(parent, middle));
+            if !transitive {
+                edges.push((parent, child));
+            }
+        }
+    }
+    edges.sort_unstable();
+    edges
+}
+
+fn node_sort_key(node: &GraphNode) -> (u8, &str) {
+    let kind = if node.kind == RefKind::Local { 0 } else { 1 };
+    (kind, node.name.as_str())
+}
+
+fn root_sort_key(node: &GraphNode) -> (u8, u8, &str) {
+    let conventional = match node.name.as_str() {
+        "main" | "origin/main" => 0,
+        "master" | "origin/master" => 1,
+        _ => 2,
+    };
+    let kind = if node.kind == RefKind::Local { 0 } else { 1 };
+    (conventional, kind, node.name.as_str())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_node(id: &str, name: &str, kind: RefKind, tracking_remote: bool) -> GraphNode {
-        GraphNode {
-            id: id.into(),
-            name: name.into(),
-            kind,
-            parent: (id != "root").then(|| "root".into()),
-            ahead: None,
-            behind: None,
-            current: false,
-            tracking_remote,
+    /// Builds a matrix from explicit history sets given as commit lists.
+    fn matrix(histories: &[&[u32]]) -> HistoryMatrix {
+        let len = histories.len();
+        let mut shared = vec![0; len * len];
+        for left in 0..len {
+            for right in 0..len {
+                shared[left * len + right] = histories[left]
+                    .iter()
+                    .filter(|commit| histories[right].contains(commit))
+                    .count() as u64;
+            }
+        }
+        HistoryMatrix {
+            len,
+            sizes: histories.iter().map(|h| h.len() as u64).collect(),
+            shared,
         }
     }
 
     #[test]
-    fn detects_cycle() {
-        let parents = BTreeMap::from([("a".into(), "b".into()), ("b".into(), "a".into())]);
-        assert!(detect_cycles(&parents).is_err());
+    fn matrix_reports_left_and_right_only_counts() {
+        let history = matrix(&[&[1, 2, 3], &[1, 2, 4, 5]]);
+        assert_eq!(
+            history.relation(0, 1),
+            Relation {
+                behind: 1,
+                ahead: 2
+            }
+        );
+        assert!(!history.is_strict_ancestor(0, 1));
+        assert!(!history.is_strict_ancestor(0, 0));
     }
 
     #[test]
-    fn accepts_acyclic_map() {
-        let parents = BTreeMap::from([("b".into(), "a".into()), ("c".into(), "b".into())]);
-        assert!(detect_cycles(&parents).is_ok());
+    fn reduction_removes_transitive_inclusion_edge() {
+        // main ⊂ middle ⊂ tip
+        let history = matrix(&[&[1], &[1, 2], &[1, 2, 3]]);
+        assert_eq!(
+            transitive_reduction(3, |a, d| history.is_strict_ancestor(a, d)),
+            [(0, 1), (1, 2)]
+        );
     }
 
     #[test]
-    fn sorts_tracking_remote_then_local_then_other_remote() {
-        let nodes = BTreeMap::from([
-            (
-                "root".into(),
-                test_node("root", "main", RefKind::Local, false),
-            ),
-            (
-                "remote-other".into(),
-                test_node("remote-other", "upstream/z", RefKind::Remote, false),
-            ),
-            (
-                "local".into(),
-                test_node("local", "alpha", RefKind::Local, false),
-            ),
-            (
-                "remote-tracking".into(),
-                test_node("remote-tracking", "origin/main", RefKind::Remote, true),
-            ),
-        ]);
-        let graph = BranchGraph {
-            root: "root".into(),
-            nodes,
-            unplaced: Vec::new(),
+    fn reduction_keeps_both_merge_parents() {
+        // main, left, right, merge
+        let history = matrix(&[&[1], &[1, 2], &[1, 3], &[1, 2, 3, 4]]);
+        let edges = transitive_reduction(4, |a, d| history.is_strict_ancestor(a, d));
+        assert_eq!(edges, [(0, 1), (0, 2), (1, 3), (2, 3)]);
+    }
+
+    #[test]
+    fn display_name_keeps_every_alias() {
+        let node = GraphNode {
+            id: "refs/heads/dev".into(),
+            oid: "a".into(),
+            name: "dev".into(),
+            aliases: vec!["origin/dev".into(), "origin/player-fix".into()],
+            kind: RefKind::Local,
+            parents: Vec::new(),
+            current: false,
         };
-        let names: Vec<_> = graph
-            .children("root")
-            .into_iter()
-            .map(|node| node.name.as_str())
-            .collect();
-        assert_eq!(names, ["origin/main", "alpha", "upstream/z"]);
+        assert_eq!(node.display_name(), "dev (= origin/dev, origin/player-fix)");
     }
 }

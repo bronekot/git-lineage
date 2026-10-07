@@ -4,10 +4,12 @@ pub mod text;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum FetchStatus {
     Updated,
     Skipped,
+    /// The remote to fetch is not configured, so local data is used.
+    MissingRemote,
     Failed,
 }
 

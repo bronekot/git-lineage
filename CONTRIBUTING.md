@@ -6,7 +6,7 @@ Thank you for helping improve `git-lineage`.
 
 - Search existing issues first.
 - Remove tokens, credential-bearing URLs, private repository names, and other secrets from logs.
-- Include the operating system, `git --version`, `git lineage --version`, the command used, and a minimal sanitized `.git-lineage.toml` when relevant.
+- Include the operating system, `git --version`, `git lineage --version`, the command used, and a minimal sanitized ref history that reproduces the problem.
 
 Security vulnerabilities must not be reported in public issues. Follow [SECURITY.md](SECURITY.md).
 

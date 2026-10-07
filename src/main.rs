@@ -1,6 +1,4 @@
 mod cli;
-mod config;
-mod discover;
 mod error;
 mod git;
 mod graph;

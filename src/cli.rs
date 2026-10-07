@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
@@ -33,24 +31,16 @@ pub enum ColorMode {
 #[command(
     name = "git-lineage",
     version,
-    about = "Compact semantic branch trees for Git repositories"
+    about = "Transitively reduced history-inclusion graph for Git branch refs"
 )]
 pub struct Cli {
     /// Skip git fetch
     #[arg(long, alias = "offline", global = true)]
     pub no_fetch: bool,
 
-    /// Remote to fetch and display
-    #[arg(long, global = true)]
-    pub remote: Option<String>,
-
-    /// Root ref for the tree
-    #[arg(long, global = true)]
-    pub root: Option<String>,
-
-    /// Configuration file path
-    #[arg(long, global = true)]
-    pub config: Option<PathBuf>,
+    /// Remote to fetch before reading all refs
+    #[arg(long, global = true, default_value = "origin")]
+    pub remote: String,
 
     /// Insight detail level
     #[arg(long, value_enum, global = true)]
@@ -68,46 +58,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub ascii: bool,
 
-    /// Include branches from every remote
-    #[arg(long, global = true)]
-    pub all_remotes: bool,
-
-    /// Show synced upstream branches
-    #[arg(long, global = true)]
-    pub show_synced_remotes: bool,
-
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Build a report (the default command)
+    /// Build a factual graph (the default command)
     Report,
-    /// Create .git-lineage.toml
-    Init {
-        /// Overwrite an existing configuration file
-        #[arg(long)]
-        force: bool,
-    },
-    /// Suggest a logical branch structure
-    Discover {
-        /// Write the discovered relationships to .git-lineage.toml
-        #[arg(long)]
-        write: bool,
-    },
-    /// Set or remove a branch parent
-    Parent {
-        /// Child branch
-        child: String,
-        /// Logical parent branch
-        parent: Option<String>,
-        /// Remove the configured parent
-        #[arg(long, conflicts_with = "parent")]
-        unset: bool,
-    },
-    /// Validate the configuration
-    Check,
     /// Show or save the interface language
     #[command(alias = "lang")]
     Language {
@@ -148,18 +106,12 @@ fn localize_russian(command: clap::Command) -> clap::Command {
         )
         .subcommand_help_heading("Команды")
         .subcommand_value_name("КОМАНДА")
-        .about("Компактное семантическое дерево веток Git")
+        .about("Транзитивно сокращённый граф включения историй веток Git")
         .mut_arg("no_fetch", |arg| {
             russian_option(arg).help("Пропустить git fetch")
         })
         .mut_arg("remote", |arg| {
-            russian_option(arg).help("Удалённый репозиторий для получения данных и отчёта")
-        })
-        .mut_arg("root", |arg| {
-            russian_option(arg).help("Корневая ветка дерева")
-        })
-        .mut_arg("config", |arg| {
-            russian_option(arg).help("Путь к файлу конфигурации")
+            russian_option(arg).help("Удалённый репозиторий для получения данных")
         })
         .mut_arg("summary", |arg| {
             russian_option(arg)
@@ -179,42 +131,8 @@ fn localize_russian(command: clap::Command) -> clap::Command {
         .mut_arg("ascii", |arg| {
             russian_option(arg).help("Использовать символы дерева из ASCII")
         })
-        .mut_arg("all_remotes", |arg| {
-            russian_option(arg).help("Учитывать ветки из всех удалённых репозиториев")
-        })
-        .mut_arg("show_synced_remotes", |arg| {
-            russian_option(arg).help("Показывать совпадающие upstream-ветки")
-        })
         .mut_subcommand("report", |sub| {
-            localize_russian_command(sub).about("Построить отчёт (команда по умолчанию)")
-        })
-        .mut_subcommand("init", |sub| {
-            localize_russian_command(sub)
-                .about("Создать .git-lineage.toml")
-                .mut_arg("force", |arg| {
-                    russian_option(arg).help("Перезаписать существующую конфигурацию")
-                })
-        })
-        .mut_subcommand("discover", |sub| {
-            localize_russian_command(sub)
-                .about("Предложить логическую структуру веток")
-                .mut_arg("write", |arg| {
-                    russian_option(arg).help("Записать найденные связи в .git-lineage.toml")
-                })
-        })
-        .mut_subcommand("parent", |sub| {
-            localize_russian_command(sub)
-                .about("Установить или удалить родителя ветки")
-                .mut_arg("child", |arg| russian_argument(arg).help("Дочерняя ветка"))
-                .mut_arg("parent", |arg| {
-                    russian_argument(arg).help("Логическая родительская ветка")
-                })
-                .mut_arg("unset", |arg| {
-                    russian_option(arg).help("Удалить настроенного родителя")
-                })
-        })
-        .mut_subcommand("check", |sub| {
-            localize_russian_command(sub).about("Проверить конфигурацию")
+            localize_russian_command(sub).about("Построить фактический граф (команда по умолчанию)")
         })
         .mut_subcommand("language", |sub| {
             localize_russian_command(sub)

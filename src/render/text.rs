@@ -1,52 +1,63 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
     graph::BranchGraph,
     i18n::{commit_word, counted_commits, Language},
-    insights::Insight,
+    insights::{Insight, Insights},
+    relation::Relation,
     render::{FetchInfo, FetchStatus},
 };
 
-#[allow(clippy::too_many_arguments)]
 pub fn render(
     graph: &BranchGraph,
     fetch: &FetchInfo,
-    insights: &[Insight],
+    insights: &Insights,
     warnings: &[String],
     ascii: bool,
-    include_unplaced: bool,
     color: bool,
     language: Language,
 ) -> String {
     let mut out = String::new();
     render_header(&mut out, fetch, language);
 
-    let mut lines = Vec::<(String, String)>::new();
-    collect_lines(graph, &graph.root, &[], true, ascii, language, &mut lines);
-    let width = lines
-        .iter()
-        .map(|(left, _)| UnicodeWidthStr::width(left.as_str()))
-        .max()
-        .unwrap_or(0);
-    for (left, relation) in lines {
-        if relation.is_empty() {
-            out.push_str(&left);
+    let mut lines = Vec::<TreeLine>::new();
+    let mut visited = HashSet::new();
+    for root in &graph.roots {
+        collect_lines(
+            graph,
+            root,
+            None,
+            &[],
+            true,
+            ascii,
+            language,
+            &mut visited,
+            &mut lines,
+        );
+    }
+    let width = lines.iter().map(TreeLine::width).max().unwrap_or(0);
+    for line in &lines {
+        out.push_str(&line.prefix);
+        if color && line.current {
+            out.push_str(&format!("\u{1b}[1;36m{}\u{1b}[0m", line.label));
         } else {
-            let padding = width.saturating_sub(UnicodeWidthStr::width(left.as_str())) + 2;
-            out.push_str(&left);
-            out.push_str(&" ".repeat(padding));
-            out.push_str(&relation);
+            out.push_str(&line.label);
+        }
+        out.push_str(&line.suffix);
+        if !line.relation.is_empty() {
+            out.push_str(&" ".repeat(width - line.width() + 2));
+            out.push_str(&line.relation);
         }
         out.push('\n');
     }
 
-    let insight_lines = insight_lines(insights, language);
-    if !insight_lines.is_empty()
-        || !warnings.is_empty()
-        || (include_unplaced && !graph.unplaced.is_empty())
-    {
+    let mut insight_lines = insight_lines(&insights.items, language);
+    if insights.hidden_diverged > 0 {
+        insight_lines.push(hidden_divergence_hint(insights.hidden_diverged, language));
+    }
+    if !insight_lines.is_empty() || !warnings.is_empty() {
         out.push('\n');
     }
     for line in insight_lines {
@@ -59,38 +70,67 @@ pub fn render(
         out.push_str(warning);
         out.push('\n');
     }
-    if include_unplaced && !graph.unplaced.is_empty() {
-        out.push_str(if language.is_ru() {
-            "\nНеразмещённые ветки:\n\n"
-        } else {
-            "\nUnplaced branches:\n\n"
-        });
-        for branch in &graph.unplaced {
-            out.push_str(&format!("- {branch}\n"));
-        }
-    }
-    if color {
-        if let Some(current) = graph.nodes.values().find(|node| node.current) {
-            let marker = current_marker(language);
-            let plain = format!("{} {marker}", current.name);
-            let colored = format!("\u{1b}[1;36m{}\u{1b}[0m {marker}", current.name);
-            return out.replacen(&plain, &colored, 1);
-        }
-    }
+    out.push_str(&if language.is_ru() {
+        format!(
+            "\nСсылок: {}, узлов: {} (объединено совпадающих ссылок: {}), связей после транзитивного сокращения: {}.\n",
+            graph.total_refs,
+            graph.nodes.len(),
+            graph.merged_aliases,
+            graph.edge_count
+        )
+    } else {
+        format!(
+            "\nRefs: {}, nodes: {} (coincident refs merged: {}), edges after transitive reduction: {}.\n",
+            graph.total_refs,
+            graph.nodes.len(),
+            graph.merged_aliases,
+            graph.edge_count
+        )
+    });
     out
 }
 
+struct TreeLine {
+    prefix: String,
+    label: String,
+    suffix: String,
+    relation: String,
+    current: bool,
+}
+
+impl TreeLine {
+    fn width(&self) -> usize {
+        UnicodeWidthStr::width(self.prefix.as_str())
+            + UnicodeWidthStr::width(self.label.as_str())
+            + UnicodeWidthStr::width(self.suffix.as_str())
+    }
+}
+
+fn hidden_divergence_hint(count: usize, language: Language) -> String {
+    if language.is_ru() {
+        format!("Других расходящихся пар веток: {count}; описать их — --summary full.")
+    } else {
+        format!("Other diverged ref pairs: {count}; use --summary full to describe them.")
+    }
+}
+
 fn render_header(out: &mut String, fetch: &FetchInfo, language: Language) {
-    match (fetch.status.clone(), language) {
+    match (&fetch.status, language) {
         (FetchStatus::Updated, Language::En) => {
-            out.push_str(&format!("Fetched {}; branch graph:\n\n", fetch.remote));
+            out.push_str(&format!("Fetched {}; factual ref graph:\n\n", fetch.remote));
         }
         (FetchStatus::Skipped, Language::En) => {
-            out.push_str("Branch graph from local data:\n\n");
+            out.push_str("Factual ref graph from local data:\n\n");
+        }
+        (FetchStatus::MissingRemote, Language::En) => {
+            out.push_str(&format!(
+                "Remote {} is not configured; factual ref graph from local data:\n\n",
+                fetch.remote
+            ));
         }
         (FetchStatus::Failed, Language::En) => {
             out.push_str(&format!(
-                "Could not fetch {}; branch graph uses cached data:\n",
+                "Could not fetch {}; factual ref graph uses cached data:\n",
                 fetch.remote
             ));
             if let Some(reason) = &fetch.reason {
@@ -100,16 +140,22 @@ fn render_header(out: &mut String, fetch: &FetchInfo, language: Language) {
         }
         (FetchStatus::Updated, Language::Ru) => {
             out.push_str(&format!(
-                "Данные из {} получены; граф веток:\n\n",
+                "Данные из {} получены; фактический граф refs:\n\n",
                 fetch.remote
             ));
         }
         (FetchStatus::Skipped, Language::Ru) => {
-            out.push_str("Граф веток по локальным данным:\n\n");
+            out.push_str("Фактический граф refs по локальным данным:\n\n");
+        }
+        (FetchStatus::MissingRemote, Language::Ru) => {
+            out.push_str(&format!(
+                "Удалённый репозиторий {} не настроен; фактический граф refs по локальным данным:\n\n",
+                fetch.remote
+            ));
         }
         (FetchStatus::Failed, Language::Ru) => {
             out.push_str(&format!(
-                "Не удалось получить данные из {}; граф построен по сохранённым данным:\n",
+                "Не удалось получить данные из {}; фактический граф refs построен по сохранённым данным:\n",
                 fetch.remote
             ));
             if let Some(reason) = &fetch.reason {
@@ -124,13 +170,16 @@ fn render_header(out: &mut String, fetch: &FetchInfo, language: Language) {
 fn collect_lines(
     graph: &BranchGraph,
     id: &str,
+    edge: Option<(&str, u64)>,
     ancestors_last: &[bool],
     is_last: bool,
     ascii: bool,
     language: Language,
-    lines: &mut Vec<(String, String)>,
+    visited: &mut HashSet<String>,
+    lines: &mut Vec<TreeLine>,
 ) {
     let node = &graph.nodes[id];
+    let repeated = !visited.insert(id.to_owned());
     let mut left = String::new();
     if !ancestors_last.is_empty() {
         for &ancestor_last in &ancestors_last[..ancestors_last.len() - 1] {
@@ -154,26 +203,50 @@ fn collect_lines(
             "├─ "
         });
     }
-    left.push_str(&node.name);
+    let mut suffix = String::new();
     if node.current {
-        left.push(' ');
-        left.push_str(current_marker(language));
+        suffix.push(' ');
+        suffix.push_str(current_marker(language));
     }
-    let relation = node
-        .relation()
-        .and_then(|relation| {
-            let parent = node.parent.as_ref()?;
-            Some(relation.compact(&graph.nodes[parent].name, language))
+    if repeated {
+        suffix.push_str(if language.is_ru() {
+            " (уже показана выше)"
+        } else {
+            " (already shown above)"
+        });
+    }
+    let relation = edge
+        .map(|(parent, ahead)| {
+            Relation { ahead, behind: 0 }.compact(&graph.nodes[parent].name, language)
         })
         .unwrap_or_default();
-    lines.push((left, relation));
+    lines.push(TreeLine {
+        prefix: left,
+        label: node.display_name(),
+        suffix,
+        relation,
+        current: node.current,
+    });
+    if repeated {
+        return;
+    }
 
     let children = graph.children(id);
-    for (index, child) in children.iter().enumerate() {
+    for (index, (child, child_edge)) in children.iter().enumerate() {
         let child_last = index + 1 == children.len();
         let mut next = ancestors_last.to_vec();
         next.push(child_last);
-        collect_lines(graph, &child.id, &next, child_last, ascii, language, lines);
+        collect_lines(
+            graph,
+            &child.id,
+            Some((id, child_edge.ahead)),
+            &next,
+            child_last,
+            ascii,
+            language,
+            visited,
+            lines,
+        );
     }
 }
 
@@ -187,37 +260,20 @@ fn current_marker(language: Language) -> &'static str {
 
 fn insight_lines(insights: &[Insight], language: Language) -> Vec<String> {
     let mut lines = Vec::new();
-    let mut root_groups: BTreeMap<(&str, u64), Vec<&str>> = BTreeMap::new();
     let mut synced: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-
     for insight in insights {
         match insight {
-            Insight::RootBehind {
-                root,
-                branch,
-                count,
-            } => root_groups.entry((root, *count)).or_default().push(branch),
             Insight::SyncedUpstream { branch, upstream } => {
                 let remote = upstream
                     .split_once('/')
-                    .map(|(remote, _)| remote)
+                    .map(|(name, _)| name)
                     .unwrap_or("remote");
                 synced.entry(remote).or_default().push(branch);
             }
-            Insight::AutoParent {
-                branch,
-                parent,
-                distance,
-            } => lines.push(if language.is_ru() {
-                format!(
-                    "Вероятный родитель ветки {branch} — {parent}: ближайший строгий предок, расстояние — {}.",
-                    counted_commits(language, *distance)
-                )
+            Insight::UpstreamGone { branch, upstream } => lines.push(if language.is_ru() {
+                format!("Локальная ветка {branch} отслеживает {upstream}, которой больше нет.")
             } else {
-                format!(
-                    "Likely parent of {branch}: {parent} (nearest strict ancestor, {} away).",
-                    counted_commits(language, *distance)
-                )
+                format!("Local branch {branch} tracks {upstream}, which no longer exists.")
             }),
             Insight::TrackingBehind {
                 branch,
@@ -267,86 +323,63 @@ fn insight_lines(insights: &[Insight], language: Language) -> Vec<String> {
                     unique_commits_en(*remote_count)
                 )
             }),
-            Insight::Siblings {
-                parent,
+            Insight::Diverged {
                 left,
                 right,
                 left_count,
                 right_count,
-            } if left_count == right_count => lines.push(if language.is_ru() {
-                format!(
-                    "{left} и {right} — соседние ветки от {parent}: у каждой есть {}.",
-                    per_unique_commits_ru(*left_count)
-                )
-            } else {
-                format!(
-                    "{left} and {right} are sibling branches from {parent}: each has {}.",
-                    unique_commits_en(*left_count)
-                )
-            }),
-            Insight::Siblings {
-                parent,
-                left,
-                right,
-                left_count,
-                right_count,
-            } => lines.push(if language.is_ru() {
-                format!(
-                    "{left} и {right} разошлись от {parent}: в {left} есть {}, а в {right} — {}.",
-                    unique_commits_ru(*left_count),
-                    unique_commits_ru(*right_count)
-                )
-            } else {
-                format!(
-                    "{left} and {right} diverged from {parent}: {left} has {}, while {right} has {}.",
-                    unique_commits_en(*left_count),
-                    unique_commits_en(*right_count)
-                )
-            }),
+                common_ancestors,
+            } => {
+                let base = if common_ancestors.is_empty() {
+                    String::new()
+                } else if language.is_ru() {
+                    format!(
+                        " Ближайшая общая отображаемая база: {}.",
+                        common_ancestors.join(", ")
+                    )
+                } else {
+                    format!(
+                        " Nearest displayed common base: {}.",
+                        common_ancestors.join(", ")
+                    )
+                };
+                lines.push(if language.is_ru() {
+                    format!(
+                        "{left} и {right} разошлись: в {left} есть {}, а в {right} — {}.{base}",
+                        unique_commits_ru(*left_count),
+                        unique_commits_ru(*right_count)
+                    )
+                } else {
+                    format!(
+                        "{left} and {right} diverged: {left} has {}, while {right} has {}.{base}",
+                        unique_commits_en(*left_count),
+                        unique_commits_en(*right_count)
+                    )
+                });
+            }
         }
-    }
-    for ((root, count), branches) in root_groups {
-        lines.insert(
-            0,
-            if language.is_ru() {
-                format!(
-                    "{root} отстаёт от {} на {}.",
-                    join_names(&branches, language),
-                    counted_commits(language, count)
-                )
-            } else {
-                format!(
-                    "{root} is {} behind {}.",
-                    counted_commits(language, count),
-                    join_names(&branches, language)
-                )
-            },
-        );
     }
     for (remote, branches) in synced {
-        if language.is_ru() {
+        lines.push(if language.is_ru() {
             if branches.len() == 1 {
-                lines.push(format!(
+                format!(
                     "{} совпадает с соответствующей веткой на {remote}.",
                     branches[0]
-                ));
+                )
             } else {
-                lines.push(format!(
+                format!(
                     "{} совпадают с соответствующими ветками на {remote}.",
                     join_names(&branches, language)
-                ));
+                )
             }
         } else if branches.len() == 1 {
-            lines.push(format!(
-                "{} matches its counterpart on {remote}.",
-                branches[0]
-            ));
+            format!("{} matches its counterpart on {remote}.", branches[0])
         } else {
-            lines.push(format!(
+            format!(
                 "{} match their counterparts on {remote}.",
                 join_names(&branches, language)
-            ));
-        }
+            )
+        });
     }
     lines
 }
@@ -374,13 +407,5 @@ fn unique_commits_ru(count: u64) -> String {
         format!("{count} уникальный коммит")
     } else {
         format!("{count} уникальных {}", commit_word(Language::Ru, count))
-    }
-}
-
-fn per_unique_commits_ru(count: u64) -> String {
-    if count % 10 == 1 && count % 100 != 11 {
-        format!("по {count} уникальному коммиту")
-    } else {
-        format!("по {count} уникальных {}", commit_word(Language::Ru, count))
     }
 }

@@ -44,10 +44,6 @@ impl Repo {
         git(&self.path, &["commit", "-m", message]);
     }
 
-    fn config(&self, text: &str) {
-        fs::write(self.path.join(".git-lineage.toml"), text).unwrap();
-    }
-
     fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_git-lineage"))
             .args(args)
@@ -83,149 +79,225 @@ fn stdout(output: &Output) -> String {
 }
 
 #[test]
-fn language_defaults_to_english_and_persists_across_processes() {
-    let temp = tempfile::tempdir().unwrap();
-    let global_config = temp.path().join("global.gitconfig");
-    let run = |cwd: &Path, args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_git-lineage"))
-            .args(args)
-            .current_dir(cwd)
-            .env("GIT_CONFIG_GLOBAL", &global_config)
-            .output()
-            .unwrap()
+fn factual_topology_includes_every_ref_groups_oids_and_reduces_transitive_edges() {
+    let repo = Repo::new();
+    let tree = git(&repo.path, &["rev-parse", "main^{tree}"]);
+    let main = git(&repo.path, &["rev-parse", "main"]);
+    let commit = |parent: &str, message: &str| {
+        git(
+            &repo.path,
+            &["commit-tree", &tree, "-p", parent, "-m", message],
+        )
     };
+    let hls = commit(&main, "hls");
+    let ui = commit(&hls, "ui");
+    let remote_hls = commit(&ui, "remote hls");
+    let load = commit(&remote_hls, "load");
+    let google = commit(&load, "google");
+    let remote_ui = commit(&google, "remote ui");
+    let dev = commit(&remote_ui, "dev");
+    let ui_ux = commit(&dev, "ui ux");
 
-    let default_language = stdout(&run(temp.path(), &["language"]));
-    assert!(default_language.contains("Language: English (en)."));
-    let english_help = stdout(&run(temp.path(), &["--help"]));
-    assert!(english_help.contains("Compact semantic branch trees"));
-    assert!(english_help.contains("Show synced upstream branches"));
-    let english_error = run(temp.path(), &["--no-fetch"]);
-    assert_eq!(english_error.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&english_error.stderr)
-        .contains("Error: the command was run outside a Git repository"));
+    for (name, oid) in [
+        ("refs/heads/hls-fix", &hls),
+        ("refs/heads/ui-fix", &ui),
+        ("refs/heads/dev", &dev),
+        ("refs/heads/ui-ux-fix", &ui_ux),
+        ("refs/remotes/origin/main", &main),
+        ("refs/remotes/origin/hls-fix", &remote_hls),
+        ("refs/remotes/origin/load-optimization", &load),
+        ("refs/remotes/origin/google-fix", &google),
+        ("refs/remotes/origin/ui-fix", &remote_ui),
+        ("refs/remotes/origin/dev", &dev),
+        ("refs/remotes/origin/player-fix", &dev),
+    ] {
+        git(&repo.path, &["update-ref", name, oid]);
+    }
+    git(&repo.path, &["switch", "ui-ux-fix"]);
 
-    let saved_russian = stdout(&run(temp.path(), &["language", "ru"]));
-    assert!(saved_russian.contains("Язык сохранён: русский (ru)."));
-    let reloaded_russian = stdout(&run(temp.path(), &["language"]));
-    assert!(reloaded_russian.contains("Язык: русский (ru)."));
-    let russian_help = stdout(&run(temp.path(), &["--help"]));
-    assert!(russian_help.contains("Компактное семантическое дерево веток Git"));
-    assert!(russian_help.contains("Удалённый репозиторий для получения данных и отчёта"));
-    let russian_error = run(temp.path(), &["--no-fetch"]);
-    assert_eq!(russian_error.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&russian_error.stderr)
-        .contains("Ошибка: команда запущена вне Git-репозитория"));
-
-    let mut repo = Repo::new();
-    git(&repo.path, &["switch", "-c", "dev"]);
-    repo.commit("dev");
-    let russian_report = stdout(&run(&repo.path, &["--no-fetch", "--summary", "full"]));
-    assert!(russian_report.contains("Граф веток по локальным данным:"));
-    assert!(russian_report.contains("dev (текущая)"));
-    assert!(russian_report.contains("+1 от main"));
-    assert!(russian_report.contains("Вероятный родитель ветки dev — main"));
-    assert!(russian_report.contains("расстояние — 1 коммит."));
-
-    let saved_english = stdout(&run(temp.path(), &["language", "en"]));
-    assert!(saved_english.contains("Language saved: English (en)."));
-    let english_report = stdout(&run(&repo.path, &["--no-fetch", "--summary", "full"]));
-    assert!(english_report.contains("Branch graph from local data:"));
-    assert!(english_report.contains("dev (current)"));
-    assert!(english_report.contains("+1 from main"));
-    assert!(english_report.contains("Likely parent of dev: main"));
-    assert!(english_report.contains("1 commit away"));
-}
-
-#[test]
-fn renders_linear_tree_and_json() {
-    let mut repo = Repo::new();
-    git(&repo.path, &["switch", "-c", "dev"]);
-    repo.commit("dev");
-    git(&repo.path, &["switch", "-c", "feature"]);
-    repo.commit("feature");
-    repo.config(
-        "version = 1\nroot = \"main\"\nremote = \"origin\"\nfetch = false\n\n[parents]\ndev = \"main\"\nfeature = \"dev\"\n",
-    );
-
-    let head_before = git(&repo.path, &["rev-parse", "HEAD"]);
-    let status_before = git(&repo.path, &["status", "--porcelain"]);
     let text = stdout(&repo.run(&["--no-fetch", "--summary", "none"]));
-    assert!(text.contains("main\n└─ dev"), "{text}");
-    assert!(text.contains("└─ feature (current)"), "{text}");
-    assert!(text.contains("+1 from main"), "{text}");
-
-    let json = stdout(&repo.run(&["report", "--no-fetch", "--format", "json"]));
-    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(value["root"], "main");
-    assert_eq!(value["current_branch"], "feature");
-    assert_eq!(value["nodes"].as_array().unwrap().len(), 3);
-    assert_eq!(git(&repo.path, &["rev-parse", "HEAD"]), head_before);
-    assert_eq!(git(&repo.path, &["status", "--porcelain"]), status_before);
-
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_git-lineage"));
-    let mut paths = vec![binary.parent().unwrap().to_path_buf()];
-    paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
-    let via_git = Command::new("git")
-        .args(["lineage", "--no-fetch", "--summary", "none"])
-        .current_dir(&repo.path)
-        .env("PATH", env::join_paths(paths).unwrap())
-        .env("GIT_CONFIG_GLOBAL", &repo.language_config)
-        .output()
-        .unwrap();
-    assert!(via_git.status.success());
-    assert!(String::from_utf8_lossy(&via_git.stdout).contains("feature (current)"));
-
-    let colored = stdout(&repo.run(&["--no-fetch", "--color", "always", "--summary", "none"]));
-    assert!(colored.contains("\u{1b}[1;36mfeature\u{1b}[0m"));
-    let plain = stdout(&repo.run(&["--no-fetch", "--color", "never", "--summary", "none"]));
-    assert!(!plain.contains("\u{1b}["));
-}
-
-#[test]
-fn report_discovers_missing_parents_conservatively() {
-    let mut repo = Repo::new();
-    git(&repo.path, &["switch", "-c", "dev"]);
-    repo.commit("dev");
-    git(&repo.path, &["switch", "-c", "feature"]);
-    repo.commit("feature");
-
-    let text = stdout(&repo.run(&["--no-fetch", "--summary", "full"]));
-    assert!(text.contains("main\n└─ dev"), "{text}");
-    assert!(text.contains("└─ feature (current)"), "{text}");
-    assert!(text.contains("Likely parent of dev: main"), "{text}");
-    assert!(text.contains("Likely parent of feature: dev"), "{text}");
-
-    repo.config(
-        "version = 1\nroot = \"main\"\nfetch = false\n\n[parents]\ndev = \"main\"\nfeature = \"main\"\n",
-    );
-    let discovered = stdout(&repo.run(&["discover", "--no-fetch"]));
-    assert!(discovered.contains("feature = \"main\""), "{discovered}");
-}
-
-#[test]
-fn compares_sibling_leaf_branches() {
-    let mut repo = Repo::new();
-    git(&repo.path, &["switch", "-c", "dev"]);
-    repo.commit("dev");
-    git(&repo.path, &["switch", "-c", "лево"]);
-    repo.commit("left");
-    git(&repo.path, &["switch", "dev"]);
-    git(&repo.path, &["switch", "-c", "right"]);
-    repo.commit("right");
-    repo.config(
-        "version = 1\nroot = \"main\"\nfetch = false\n\n[parents]\ndev = \"main\"\n\"лево\" = \"dev\"\nright = \"dev\"\n",
-    );
-    let text = stdout(&repo.run(&["--no-fetch"]));
+    let expected = [
+        "main (= origin/main)",
+        "hls-fix",
+        "ui-fix",
+        "origin/hls-fix",
+        "origin/load-optimization",
+        "origin/google-fix",
+        "origin/ui-fix",
+        "dev (= origin/dev, origin/player-fix)",
+        "ui-ux-fix (current)",
+    ];
+    let mut cursor = 0;
+    for name in expected {
+        let offset = text[cursor..]
+            .find(name)
+            .unwrap_or_else(|| panic!("missing {name:?} in:\n{text}"));
+        cursor += offset + name.len();
+    }
     assert!(
-        text.contains("right and лево are sibling branches from dev"),
+        text.contains(
+            "Refs: 12, nodes: 9 (coincident refs merged: 3), edges after transitive reduction: 8."
+        ),
         "{text}"
     );
-    assert!(text.contains("1 unique commit"), "{text}");
+
+    let report: serde_json::Value = serde_json::from_str(&stdout(&repo.run(&[
+        "--no-fetch",
+        "--summary",
+        "none",
+        "--format",
+        "json",
+    ])))
+    .unwrap();
+    assert_eq!(report["refs"]["discovered"], 12);
+    assert_eq!(report["refs"]["nodes"], 9);
+    assert_eq!(report["refs"]["merged_aliases"], 3);
+    assert_eq!(report["refs"]["reduced_edges"], 8);
+    assert_eq!(report["nodes"].as_array().unwrap().len(), 9);
+    assert_eq!(report["relations"].as_array().unwrap().len(), 36);
+
+    let relation = report["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| {
+            item["left"] == "origin/hls-fix" && item["right"] == "origin/load-optimization"
+        })
+        .unwrap();
+    assert_eq!(relation["left_only"], 0);
+    assert_eq!(relation["right_only"], 1);
+    assert_eq!(relation["relation"], "left_ancestor");
+    for relation in report["relations"].as_array().unwrap() {
+        let range = format!(
+            "{}...{}",
+            relation["left"].as_str().unwrap(),
+            relation["right"].as_str().unwrap()
+        );
+        assert_eq!(
+            git(&repo.path, &["rev-list", "--left-right", "--count", &range]),
+            format!("{}\t{}", relation["left_only"], relation["right_only"]),
+            "{range}"
+        );
+    }
 }
 
 #[test]
-fn collapses_synced_upstream_and_shows_differing_upstream() {
+fn diverged_refs_are_siblings_with_objective_counts() {
+    let mut repo = Repo::new();
+    git(&repo.path, &["switch", "-c", "left"]);
+    repo.commit("left");
+    git(&repo.path, &["switch", "main"]);
+    git(&repo.path, &["switch", "-c", "right"]);
+    repo.commit("right");
+
+    let text = stdout(&repo.run(&["--no-fetch", "--summary", "brief"]));
+    assert!(text.contains("main\n├─ left"), "{text}");
+    assert!(text.contains("└─ right (current)"), "{text}");
+    assert!(
+        text.contains(
+            "left and right diverged: left has 1 unique commit, while right has 1 unique commit."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("Nearest displayed common base: main."),
+        "{text}"
+    );
+    assert_eq!(
+        git(
+            &repo.path,
+            &["rev-list", "--left-right", "--count", "left...right"]
+        ),
+        "1\t1"
+    );
+}
+
+#[test]
+fn merge_node_keeps_both_immediate_history_parents() {
+    let repo = Repo::new();
+    let tree = git(&repo.path, &["rev-parse", "main^{tree}"]);
+    let main = git(&repo.path, &["rev-parse", "main"]);
+    let left = git(
+        &repo.path,
+        &["commit-tree", &tree, "-p", &main, "-m", "left"],
+    );
+    let right = git(
+        &repo.path,
+        &["commit-tree", &tree, "-p", &main, "-m", "right"],
+    );
+    let merge = git(
+        &repo.path,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &left,
+            "-p",
+            &right,
+            "-m",
+            "merge",
+        ],
+    );
+    for (name, oid) in [("left", &left), ("right", &right), ("merge", &merge)] {
+        git(&repo.path, &["branch", name, oid]);
+    }
+
+    let report: serde_json::Value = serde_json::from_str(&stdout(&repo.run(&[
+        "--no-fetch",
+        "--summary",
+        "none",
+        "--format",
+        "json",
+    ])))
+    .unwrap();
+    let merge_node = report["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "merge")
+        .unwrap();
+    let parents: Vec<_> = merge_node["parents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|parent| parent["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(parents, ["left", "right"]);
+
+    let text = stdout(&repo.run(&["--no-fetch", "--summary", "none"]));
+    assert!(text.contains("merge (already shown above)"), "{text}");
+    assert!(
+        text.contains("edges after transitive reduction: 4."),
+        "{text}"
+    );
+}
+
+#[test]
+fn unrelated_histories_are_rendered_as_separate_roots() {
+    let repo = Repo::new();
+    let tree = git(&repo.path, &["rev-parse", "main^{tree}"]);
+    let orphan = git(&repo.path, &["commit-tree", &tree, "-m", "orphan"]);
+    git(&repo.path, &["branch", "experiment", &orphan]);
+    fs::write(repo.path.join(".git-lineage.toml"), "this is ignored").unwrap();
+
+    let report: serde_json::Value = serde_json::from_str(&stdout(&repo.run(&[
+        "--no-fetch",
+        "--summary",
+        "none",
+        "--format",
+        "json",
+    ])))
+    .unwrap();
+    assert_eq!(report["refs"]["nodes"], 2);
+    assert_eq!(report["roots"].as_array().unwrap().len(), 2);
+
+    let removed_command = repo.run(&["init"]);
+    assert_eq!(removed_command.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&removed_command.stderr).contains("unrecognized subcommand"));
+}
+
+#[test]
+fn tracking_relation_reports_remote_ahead() {
     let mut repo = Repo::new();
     let bare = repo._temp.path().join("remote.git");
     fs::create_dir(&bare).unwrap();
@@ -249,243 +321,76 @@ fn collapses_synced_upstream_and_shows_differing_upstream() {
     git(&peer, &["push", "origin", "dev"]);
     git(&repo.path, &["fetch", "origin"]);
 
-    repo.config(
-        "version = 1\nroot = \"main\"\nremote = \"origin\"\nfetch = false\n\n[parents]\ndev = \"main\"\n",
-    );
-    let text = stdout(&repo.run(&["--no-fetch"]));
-    assert!(text.contains("└─ origin/dev"), "{text}");
+    let text = stdout(&repo.run(&["--no-fetch", "--summary", "brief"]));
     assert!(
         text.contains("Local branch dev is 1 commit behind origin/dev"),
         "{text}"
     );
+
+    git(&repo.path, &["push", "origin", "--delete", "dev"]);
+    git(&repo.path, &["fetch", "--prune", "origin"]);
+    let text = stdout(&repo.run(&["--summary", "brief"]));
+    assert!(text.starts_with("Fetched origin;"), "{text}");
     assert!(
-        !text.contains("─ origin/main"),
-        "synced main must be collapsed: {text}"
+        text.contains("Local branch dev tracks origin/dev, which no longer exists."),
+        "{text}"
     );
+}
+
+#[test]
+fn missing_remote_is_reported_without_a_fetch_error() {
+    let repo = Repo::new();
+    let text = stdout(&repo.run(&[]));
     assert!(
-        text.contains("main matches its counterpart on origin"),
+        text.starts_with("Remote origin is not configured; factual ref graph from local data:"),
         "{text}"
     );
 
-    let shown = stdout(&repo.run(&["--no-fetch", "--show-synced-remotes", "--summary", "none"]));
-    assert!(shown.contains("origin/main"), "{shown}");
-
-    let missing = repo._temp.path().join("missing-remote.git");
-    let missing_text = missing.to_string_lossy().into_owned();
-    git(&repo.path, &["remote", "set-url", "origin", &missing_text]);
-    repo.config(
-        "version = 1\nroot = \"main\"\nremote = \"origin\"\nfetch = true\n\n[parents]\ndev = \"main\"\n",
-    );
-    let cached = stdout(&repo.run(&[]));
-    assert!(cached.contains("Could not fetch origin"), "{cached}");
-    assert!(cached.contains("origin/dev"), "{cached}");
-
-    repo.config(
-        "version = 1\nroot = \"main\"\nremote = \"origin\"\nfetch = false\n\n[parents]\n\"origin/main\" = \"dev\"\n",
-    );
-    assert_eq!(repo.run(&["--no-fetch"]).status.code(), Some(2));
+    let output = repo.run(&["--format", "json"]);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(report["fetch"]["status"], "missing_remote");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Remote origin is not configured"));
 }
 
 #[test]
-fn reports_local_ahead_and_diverged_tracking_states() {
+fn brief_summary_explains_only_the_current_branch_divergence() {
     let mut repo = Repo::new();
-    let bare = repo._temp.path().join("remote-diverged.git");
-    fs::create_dir(&bare).unwrap();
-    git(&bare, &["init", "--bare"]);
-    let bare_text = bare.to_string_lossy().into_owned();
-    git(&repo.path, &["remote", "add", "origin", &bare_text]);
-    git(&repo.path, &["push", "-u", "origin", "main"]);
-    git(&repo.path, &["switch", "-c", "dev"]);
-    repo.commit("dev");
-    git(&repo.path, &["push", "-u", "origin", "dev"]);
+    for name in ["a", "b", "c"] {
+        git(&repo.path, &["switch", "-c", name, "main"]);
+        repo.commit(name);
+    }
 
-    repo.commit("local only");
-    let ahead = stdout(&repo.run(&["--no-fetch"]));
+    let text = stdout(&repo.run(&["--no-fetch"]));
+    assert!(text.contains("a and c diverged"), "{text}");
+    assert!(text.contains("b and c diverged"), "{text}");
+    assert!(!text.contains("a and b diverged"), "{text}");
     assert!(
-        ahead.contains("Local branch dev is 1 commit ahead of origin/dev"),
-        "{ahead}"
-    );
-
-    stdout(&repo.run(&["language", "ru"]));
-    let ahead_ru = stdout(&repo.run(&["--no-fetch"]));
-    assert!(
-        ahead_ru.contains("Локальная ветка dev опережает origin/dev на 1 коммит"),
-        "{ahead_ru}"
-    );
-    stdout(&repo.run(&["language", "en"]));
-
-    let peer = repo._temp.path().join("peer-diverged");
-    let peer_text = peer.to_string_lossy().into_owned();
-    git(repo._temp.path(), &["clone", &bare_text, &peer_text]);
-    git(&peer, &["config", "user.name", "Peer"]);
-    git(&peer, &["config", "user.email", "peer@example.invalid"]);
-    git(&peer, &["switch", "dev"]);
-    fs::write(peer.join("remote.txt"), "remote only").unwrap();
-    git(&peer, &["add", "remote.txt"]);
-    git(&peer, &["commit", "-m", "remote only"]);
-    git(&peer, &["push", "origin", "dev"]);
-    git(&repo.path, &["fetch", "origin"]);
-
-    let diverged = stdout(&repo.run(&["--no-fetch"]));
-    assert!(
-        diverged.contains("dev and origin/dev diverged"),
-        "{diverged}"
-    );
-    assert!(diverged.contains("dev has 1 unique commit"), "{diverged}");
-}
-
-#[test]
-fn full_report_includes_remote_only_and_fetch_prunes_deleted_ref() {
-    let repo = Repo::new();
-    let bare = repo._temp.path().join("remote-prune.git");
-    fs::create_dir(&bare).unwrap();
-    git(&bare, &["init", "--bare"]);
-    let bare_text = bare.to_string_lossy().into_owned();
-    git(&repo.path, &["remote", "add", "origin", &bare_text]);
-    git(&repo.path, &["push", "-u", "origin", "main"]);
-
-    let peer = repo._temp.path().join("peer-prune");
-    let peer_text = peer.to_string_lossy().into_owned();
-    git(repo._temp.path(), &["clone", &bare_text, &peer_text]);
-    git(&peer, &["config", "user.name", "Peer"]);
-    git(&peer, &["config", "user.email", "peer@example.invalid"]);
-    git(&peer, &["switch", "-c", "remote-only", "origin/main"]);
-    fs::write(peer.join("remote-only.txt"), "remote").unwrap();
-    git(&peer, &["add", "remote-only.txt"]);
-    git(&peer, &["commit", "-m", "remote-only"]);
-    git(&peer, &["push", "-u", "origin", "remote-only"]);
-    git(&repo.path, &["fetch", "origin"]);
-    repo.config(
-        "version = 1\nroot = \"main\"\nremote = \"origin\"\nfetch = true\n\n[display]\nshow_remote_only = true\nsummary = \"full\"\n",
-    );
-
-    let before = stdout(&repo.run(&["--no-fetch", "--format", "json"]));
-    let value: serde_json::Value = serde_json::from_str(&before).unwrap();
-    assert!(value["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|node| node["name"] == "origin/remote-only"));
-
-    git(&peer, &["push", "origin", "--delete", "remote-only"]);
-    let after = stdout(&repo.run(&["--summary", "full"]));
-    assert!(after.contains("Fetched origin"), "{after}");
-    assert!(!after.contains("remote-only"), "{after}");
-}
-
-#[test]
-fn fetch_failure_without_remote_is_non_fatal_and_shallow_clone_warns() {
-    let mut source = Repo::new();
-    source.commit("second");
-    let no_remote = source.run(&[]);
-    assert!(
-        no_remote.status.success(),
-        "{}",
-        String::from_utf8_lossy(&no_remote.stderr)
-    );
-    assert!(String::from_utf8_lossy(&no_remote.stdout).contains("Could not fetch origin"));
-    let json_failure = source.run(&["--format", "json"]);
-    assert!(json_failure.status.success());
-    serde_json::from_slice::<serde_json::Value>(&json_failure.stdout).unwrap();
-    assert!(String::from_utf8_lossy(&json_failure.stderr).contains("Could not fetch origin"));
-
-    stdout(&source.run(&["language", "ru"]));
-    let no_remote_ru = stdout(&source.run(&[]));
-    assert!(
-        no_remote_ru
-            .contains("Не удалось получить данные из origin; граф построен по сохранённым данным:"),
-        "{no_remote_ru}"
-    );
-    stdout(&source.run(&["language", "en"]));
-
-    let shallow = source._temp.path().join("shallow");
-    let shallow_text = shallow.to_string_lossy().into_owned();
-    let source_uri = format!(
-        "file:///{}",
-        source.path.to_string_lossy().replace('\\', "/")
-    );
-    git(
-        source._temp.path(),
-        &["clone", "--depth", "1", &source_uri, &shallow_text],
-    );
-    let output = Command::new(env!("CARGO_BIN_EXE_git-lineage"))
-        .arg("--no-fetch")
-        .current_dir(&shallow)
-        .env("GIT_CONFIG_GLOBAL", &source.language_config)
-        .output()
-        .unwrap();
-    let text = stdout(&output);
-    assert!(
-        text.contains("Repository history is limited by a shallow clone"),
+        text.contains("Other diverged ref pairs: 1; use --summary full to describe them."),
         "{text}"
     );
 
-    stdout(&source.run(&["language", "ru"]));
-    let russian_output = Command::new(env!("CARGO_BIN_EXE_git-lineage"))
-        .arg("--no-fetch")
-        .current_dir(&shallow)
-        .env("GIT_CONFIG_GLOBAL", &source.language_config)
-        .output()
-        .unwrap();
-    let russian_text = stdout(&russian_output);
-    assert!(
-        russian_text.contains("История ограничена из-за неполного (shallow) клона"),
-        "{russian_text}"
-    );
+    let text = stdout(&repo.run(&["--no-fetch", "--summary", "full"]));
+    assert!(text.contains("a and b diverged"), "{text}");
+    assert!(!text.contains("Other diverged ref pairs"), "{text}");
 }
 
 #[test]
-fn detached_head_and_ascii_are_reported() {
-    let repo = Repo::new();
-    git(&repo.path, &["checkout", "--detach", "HEAD"]);
-    let text = stdout(&repo.run(&["--no-fetch", "--ascii"]));
-    assert!(text.contains("HEAD is detached at"), "{text}");
-    assert!(text.contains("there is no current local branch"), "{text}");
-    assert!(!text.contains("(current)"), "{text}");
-
-    stdout(&repo.run(&["language", "ru"]));
-    let russian = stdout(&repo.run(&["--no-fetch", "--ascii"]));
-    assert!(
-        russian.contains("HEAD отсоединён от ветки и указывает на коммит"),
-        "{russian}"
-    );
-    assert!(
-        russian.contains("текущая локальная ветка не выбрана"),
-        "{russian}"
-    );
-}
-
-#[test]
-fn init_parent_discover_and_cycle_errors_have_expected_behavior() {
-    let mut repo = Repo::new();
-    let init = repo.run(&["init"]);
-    assert!(init.status.success());
-    assert!(repo.path.join(".git-lineage.toml").exists());
-    assert_eq!(repo.run(&["init"]).status.code(), Some(2));
-    assert_eq!(repo.run(&["check"]).status.code(), Some(2));
-
-    git(&repo.path, &["switch", "-c", "feature"]);
-    repo.commit("feature");
-    assert!(repo.run(&["parent", "feature", "main"]).status.success());
-    let saved = fs::read_to_string(repo.path.join(".git-lineage.toml")).unwrap();
-    assert!(saved.contains("feature = \"main\""));
-    assert!(repo.run(&["parent", "feature", "--unset"]).status.success());
-
-    let tree = git(&repo.path, &["rev-parse", "main^{tree}"]);
-    let orphan = git(&repo.path, &["commit-tree", &tree, "-m", "orphan"]);
-    git(&repo.path, &["branch", "experiment", &orphan]);
-
-    let discovered = stdout(&repo.run(&["discover", "--no-fetch"]));
-    assert!(discovered.contains("feature = \"main\""), "{discovered}");
-    assert!(discovered.contains("Unplaced branches"), "{discovered}");
-    assert!(discovered.contains("- experiment"), "{discovered}");
-
-    repo.config(
-        "version = 1\nroot = \"main\"\nfetch = false\n\n[parents]\nmain = \"feature\"\nfeature = \"main\"\n",
-    );
-    let cycle = repo.run(&["--no-fetch"]);
-    assert_eq!(cycle.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&cycle.stderr).contains("cycle"));
+fn language_defaults_to_english_and_persists() {
+    let temp = tempfile::tempdir().unwrap();
+    let global_config = temp.path().join("global.gitconfig");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_git-lineage"))
+            .args(args)
+            .current_dir(temp.path())
+            .env("GIT_CONFIG_GLOBAL", &global_config)
+            .output()
+            .unwrap()
+    };
+    assert!(stdout(&run(&["language"])).contains("Language: English (en)."));
+    assert!(stdout(&run(&["--help"])).contains("Transitively reduced history-inclusion graph"));
+    assert!(stdout(&run(&["language", "ru"])).contains("Язык сохранён: русский"));
+    assert!(stdout(&run(&["language"])).contains("Язык: русский (ru)."));
+    assert!(stdout(&run(&["--help"])).contains("Транзитивно сокращённый граф"));
 }
 
 #[test]
@@ -501,12 +406,9 @@ fn outside_repository_uses_exit_code_three() {
 }
 
 #[test]
-fn configured_report_scales_to_one_hundred_branches() {
+fn graph_scales_to_one_hundred_refs() {
     let repo = Repo::new();
     let tree = git(&repo.path, &["rev-parse", "main^{tree}"]);
-    let mut config = String::from(
-        "version = 1\nroot = \"main\"\nremote = \"origin\"\nfetch = false\n\n[parents]\n",
-    );
     for index in 0..100 {
         let name = format!("branch-{index:03}");
         let message = format!("branch commit {index}");
@@ -515,17 +417,11 @@ fn configured_report_scales_to_one_hundred_branches() {
             &["commit-tree", &tree, "-p", "main", "-m", &message],
         );
         git(&repo.path, &["branch", &name, &oid]);
-        config.push_str(&format!("{name} = \"main\"\n"));
     }
-    repo.config(&config);
-
     let started = Instant::now();
-    let text = stdout(&repo.run(&["--no-fetch", "--summary", "brief"]));
+    let text = stdout(&repo.run(&["--no-fetch", "--summary", "none"]));
     let elapsed = started.elapsed();
     assert!(text.contains("branch-099"));
-    assert_eq!(text.matches("sibling branches").count(), 99);
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "100-branch report took {elapsed:?}"
-    );
+    assert!(text.contains("Refs: 101, nodes: 101"), "{text}");
+    assert!(elapsed < Duration::from_secs(10), "report took {elapsed:?}");
 }

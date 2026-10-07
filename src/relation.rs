@@ -1,10 +1,6 @@
 use serde::Serialize;
 
-use crate::{
-    error::{ConfigIssue, LineageError, Result},
-    git::GitRepo,
-    i18n::{counted_commits, Language},
-};
+use crate::i18n::{counted_commits, Language};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Relation {
@@ -21,18 +17,6 @@ pub enum RelationKind {
 }
 
 impl Relation {
-    pub fn between(repo: &GitRepo, parent: &str, child: &str) -> Result<Self> {
-        let range = format!("{parent}...{child}");
-        let text = repo.checked_text(["rev-list", "--left-right", "--count", &range])?;
-        let mut parts = text.split_whitespace();
-        let behind = parts.next().and_then(|v| v.parse().ok());
-        let ahead = parts.next().and_then(|v| v.parse().ok());
-        match (behind, ahead) {
-            (Some(behind), Some(ahead)) => Ok(Self { ahead, behind }),
-            _ => Err(ConfigIssue::UnexpectedRevList(text).into()),
-        }
-    }
-
     pub fn classify(self) -> RelationKind {
         match (self.behind, self.ahead) {
             (0, 0) => RelationKind::Synced,
@@ -61,57 +45,6 @@ impl Relation {
                 format!("−{behind}/+{ahead} относительно {parent}")
             }
         }
-    }
-
-    pub fn between_many(repo: &GitRepo, pairs: &[(String, String)]) -> Result<Vec<Self>> {
-        if pairs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let worker_count = pairs.len().min(8);
-        let chunk_size = pairs.len().div_ceil(worker_count);
-        let batches = std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for (chunk_index, chunk) in pairs.chunks(chunk_size).enumerate() {
-                handles.push(scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .enumerate()
-                        .map(|(offset, (parent, child))| {
-                            (
-                                chunk_index * chunk_size + offset,
-                                Self::between(repo, parent, child),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("relation worker panicked"))
-                .collect::<Vec<_>>()
-        });
-
-        let mut ordered = vec![None; pairs.len()];
-        for (index, relation) in batches.into_iter().flatten() {
-            ordered[index] = Some(relation?);
-        }
-        Ok(ordered
-            .into_iter()
-            .map(|relation| relation.expect("relation worker omitted a result"))
-            .collect())
-    }
-}
-
-pub fn is_ancestor(repo: &GitRepo, parent: &str, child: &str) -> Result<bool> {
-    let output = repo.output(["merge-base", "--is-ancestor", parent, child])?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(LineageError::Git {
-            command: format!("git merge-base --is-ancestor {parent} {child}"),
-            status: output.status,
-            message: "could not compare branch history".into(),
-        }),
     }
 }
 
